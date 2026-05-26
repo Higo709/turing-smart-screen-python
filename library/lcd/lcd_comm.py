@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 # turing-smart-screen-python - a Python system monitor and library for USB-C displays like Turing Smart Screen or XuanFang
 # https://github.com/mathoudebine/turing-smart-screen-python/
-
-# Copyright (C) 2021-2023  Matthieu Houdebine (mathoudebine)
+#
+# Copyright (C) 2021 Matthieu Houdebine (mathoudebine)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -48,6 +50,7 @@ class LcdComm(ABC):
         self.lcd_serial = None
 
         # String containing absolute path to serial port e.g. "COM3", "/dev/ttyACM1" or "AUTO" for auto-discovery
+        # Ignored for USB HID screens
         self.com_port = com_port
 
         # Display always start in portrait orientation by default
@@ -122,6 +125,10 @@ class LcdComm(ABC):
         assert self.lcd_serial is not None
         return self.lcd_serial.read(size)
 
+    def serial_readall(self) -> bytes:
+        assert self.lcd_serial is not None
+        return self.lcd_serial.readall()
+
     def serial_flush_input(self):
         if self.lcd_serial is not None:
             self.lcd_serial.reset_input_buffer()
@@ -174,8 +181,8 @@ class LcdComm(ABC):
             return self.serial_read(readSize)
 
     @staticmethod
-    @abstractmethod
     def auto_detect_com_port() -> Optional[str]:
+        # To implement only for screens that use serial commands
         pass
 
     @abstractmethod
@@ -221,6 +228,12 @@ class LcdComm(ABC):
 
     def DisplayBitmap(self, bitmap_path: str, x: int = 0, y: int = 0, width: int = 0, height: int = 0):
         image = self.open_image(bitmap_path)
+
+        # Resize the picture if custom width/height provided
+        if width != 0 and height != 0:
+            if width != image.size[0] or height != image.size[1]:
+                image = image.resize((width, height))
+
         self.DisplayPILImage(image, x, y, width, height)
 
     def DisplayText(
@@ -244,9 +257,9 @@ class LcdComm(ABC):
         font_color = parse_color(font_color)
         background_color = parse_color(background_color)
 
-        assert x <= self.get_width(), 'Text X coordinate ' + str(x) + ' must be <= display width ' + str(
+        assert x <= self.get_width(), 'Text "' + text + '" X coordinate ' + str(x) + ' must be <= display width ' + str(
             self.get_width())
-        assert y <= self.get_height(), 'Text Y coordinate ' + str(y) + ' must be <= display height ' + str(
+        assert y <= self.get_height(), 'Text "' + text + '" Y coordinate ' + str(y) + ' must be <= display height ' + str(
             self.get_height())
         assert len(text) > 0, 'Text must not be empty'
         assert font_size > 0, "Font size must be > 0"
@@ -313,7 +326,8 @@ class LcdComm(ABC):
                            bar_color: Color = (0, 0, 0),
                            bar_outline: bool = True,
                            background_color: Color = (255, 255, 255),
-                           background_image: Optional[str] = None):
+                           background_image: Optional[str] = None,
+                           reverse_direction: Optional[bool] = False):
         # Generate a progress bar and display it
         # Provide the background image path to display progress bar with transparent background
 
@@ -343,12 +357,38 @@ class LcdComm(ABC):
             # Crop bitmap to keep only the progress bar background
             bar_image = bar_image.crop(box=(x, y, x + width, y + height))
 
-        # Draw progress bar
-        bar_filled_width = (value / (max_value - min_value) * width) - 1
-        if bar_filled_width < 0:
-            bar_filled_width = 0
+        # Draw progress bar. Fill has to be computed from the offset
+        # into [min_value, max_value], not the raw value; otherwise a
+        # bar with min_value > 0 (e.g. a 25..95 temperature bar) is
+        # filled by the wrong fraction. DisplayRadialProgressBar below
+        # already does this correctly. See issue #954.
+        if width > height:
+            bar_filled_width = ((value - min_value) / (max_value - min_value) * width) - 1
+            if bar_filled_width < 0:
+                bar_filled_width = 0
+        else:
+            bar_filled_height = ((value - min_value) / (max_value - min_value) * height) - 1
+            if bar_filled_height < 0:
+                bar_filled_height = 0
         draw = ImageDraw.Draw(bar_image)
-        draw.rectangle([0, 0, bar_filled_width, height - 1], fill=bar_color, outline=bar_color)
+
+        # most common setting
+        x1 = 0
+        y1 = 0
+        x2 = width - 1
+        y2 = height - 1
+
+        if width > height:
+            if reverse_direction is True:
+                x1 = width - 1 - bar_filled_width
+            else:
+                x2 = bar_filled_width
+        else:
+            if reverse_direction is True:
+                y2 = bar_filled_height
+            else:
+                y1 = height - 1 - bar_filled_height
+        draw.rectangle([x1, y1, x2, y2], fill=bar_color, outline=bar_color)
 
         if bar_outline:
             # Draw outline
@@ -368,7 +408,8 @@ class LcdComm(ABC):
                          axis_font: str = "./res/fonts/roboto/Roboto-Black.ttf",
                          axis_font_size: int = 10,
                          background_color: Color = (255, 255, 255),
-                         background_image: Optional[str] = None):
+                         background_image: Optional[str] = None,
+                         axis_minmax_format: str = "{:0.0f}"):
         # Generate a plot graph and display it
         # Provide the background image path to display plot graph with transparent background
 
@@ -408,7 +449,7 @@ class LcdComm(ABC):
 
         step = width / len(values)
         # pre compute yScale multiplier value
-        yScale = height / (max_value - min_value)
+        yScale = (height / (max_value - min_value)) if (max_value - min_value) != 0 else 0
 
         plotsX = []
         plotsY = []
@@ -439,13 +480,13 @@ class LcdComm(ABC):
 
             # Draw Legend
             draw.line([0, 0, 1, 0], fill=axis_color)
-            text = f"{int(max_value)}"
+            text = axis_minmax_format.format(max_value)
             ttfont = self.open_font(axis_font, axis_font_size)
             _, top, right, bottom = ttfont.getbbox(text)
             draw.text((2, 0 - top), text,
                       font=ttfont, fill=axis_color)
 
-            text = f"{int(min_value)}"
+            text = axis_minmax_format.format(min_value)
             _, top, right, bottom = ttfont.getbbox(text)
             draw.text((width - 1 - right, height - 2 - bottom), text,
                       font=ttfont, fill=axis_color)
